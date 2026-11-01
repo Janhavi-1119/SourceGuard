@@ -24,7 +24,7 @@ interface ExtractedSource {
 const MODEL = 'gemini-3.8-flash';
 
 const corsHeaders = {
-	'Access-Control-Allow-Origin': 'http://localhost:5175',
+	'Access-Control-Allow-Origin': 'https://sourceguard.pages.dev',
 	'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
 	'Access-Control-Allow-Headers': 'Content-Type',
 };
