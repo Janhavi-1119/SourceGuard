@@ -4,4 +4,13 @@ import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  server: {
+    proxy: {
+      '/api': {
+        target: 'https://sourceguard-worker.janhavinanaware11.workers.dev',
+        changeOrigin: true,
+        secure: false,
+      },
+    },
+  },
 })

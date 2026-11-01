@@ -21,7 +21,21 @@ interface ExtractedSource {
 	publishedDate?: string;
 }
 
-const MODEL = 'gemini-3.8-flash';
+const PRIMARY_MODEL = 'gemini-flash-lite-latest';
+const FALLBACK_MODEL = 'gemini-3.5-flash-lite';
+
+function getCorsHeaders(request?: Request): Record<string, string> {
+	const origin = request ? request.headers.get('Origin') || '' : '';
+	const isAllowed =
+		origin === 'https://sourceguard.pages.dev' ||
+		/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+
+	return {
+		'Access-Control-Allow-Origin': isAllowed ? origin : 'https://sourceguard.pages.dev',
+		'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+		'Access-Control-Allow-Headers': 'Content-Type',
+	};
+}
 
 const corsHeaders = {
 	'Access-Control-Allow-Origin': 'https://sourceguard.pages.dev',
@@ -222,6 +236,72 @@ async function extractSource(
 	};
 }
 
+async function callGeminiApi(
+	modelName: string,
+	prompt: string,
+	apiKey: string
+): Promise<any> {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), 25000); // 25s timeout prevents Cloudflare gateway drops
+
+	try {
+		const response = await fetch(
+			`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`,
+			{
+				method: 'POST',
+				signal: controller.signal,
+				headers: {
+					'Content-Type': 'application/json',
+					'x-goog-api-key': apiKey,
+				},
+				body: JSON.stringify({
+					contents: [
+						{
+							parts: [{ text: prompt }],
+						},
+					],
+					generationConfig: {
+						temperature: 0.1,
+						responseMimeType: 'application/json',
+						maxOutputTokens: 2048,
+					},
+				}),
+			}
+		);
+
+		const result = await response.json() as any;
+
+		if (!response.ok) {
+			const providerMessage =
+				result.error?.message || 'Gemini API request failed.';
+
+			const error = new Error(providerMessage);
+			(error as any).status = response.status;
+			throw error;
+		}
+
+		const generatedText = result.candidates?.[0]?.content?.parts
+			?.map((part: any) => part.text || '')
+			.join('');
+
+		if (!generatedText) {
+			const reason = result.candidates?.[0]?.finishReason;
+			throw new Error(
+				`Gemini returned no usable response. ${reason ? `Reason: ${reason}` : 'Please try again.'}`
+			);
+		}
+
+		return JSON.parse(generatedText);
+	} catch (err: any) {
+		if (err.name === 'AbortError') {
+			throw new Error('AI analysis timed out. Please try with shorter content or retry.');
+		}
+		throw err;
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
 async function analyzeWithGemini(
 	question: string,
 	sources: ExtractedSource[],
@@ -231,14 +311,24 @@ async function analyzeWithGemini(
 		throw new Error('Gemini API key is missing.');
 	}
 
-	const sourceContext = sources.map((source, index) => `
+	// Deduplicate source text to save unnecessary prompt tokens
+	const seen = new Set<string>();
+	const uniqueSources = sources.filter((s) => {
+		const key = s.content.trim().slice(0, 100);
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+
+	// Keep source content concise (up to 8,000 chars each) to maximize inference speed without losing evidence
+	const sourceContext = uniqueSources.map((source, index) => `
 SOURCE ${index + 1}
 Source ID: ${source.id}
 Title: ${source.title}
 Domain: ${source.domain || 'Pasted text'}
 Published date: ${source.publishedDate || 'Unknown'}
 Content:
-${source.content}
+${source.content.slice(0, 8000)}
 `).join('\n\n');
 
 	const prompt = `
@@ -320,292 +410,277 @@ Return ONLY valid JSON in this structure:
 Use empty arrays when there is no evidence for a section.
 `;
 
-	const response = await fetch(
-		`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
-		{
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-				'x-goog-api-key': env.GEMINI_API_KEY,
-			},
-			body: JSON.stringify({
-				contents: [
-					{
-						parts: [{ text: prompt }],
-					},
-				],
-				generationConfig: {
-					temperature: 0.2,
-					responseMimeType: 'application/json',
-				},
-			}),
-		}
-	);
-
-	const result = await response.json() as any;
-
-	if (!response.ok) {
-		const providerMessage =
-			result.error?.message || 'Gemini API request failed.';
-
-		if (response.status === 429) {
-			throw new Error(
-				`Gemini rate limit or quota reached. Please wait before trying again. Details: ${providerMessage}`
-			);
-		}
-
-		if (response.status === 503 || response.status === 502) {
-			throw new Error(
-				'Gemini is temporarily unavailable. Please try again shortly.'
-			);
-		}
-
-		throw new Error(providerMessage);
-	}
-
-	const generatedText = result.candidates?.[0]?.content?.parts
-		?.map((part: any) => part.text || '')
-		.join('');
-
-	if (!generatedText) {
-		const reason = result.candidates?.[0]?.finishReason;
-
-		throw new Error(
-			`Gemini returned no usable response. ${reason ? `Reason: ${reason}` : 'Please try again.'}`
-		);
-	}
-
+	// Try primary ultra-fast production model first
 	try {
-		return JSON.parse(generatedText);
-	} catch {
-		throw new Error('Gemini returned invalid JSON. Please try again.');
+		return await callGeminiApi(PRIMARY_MODEL, prompt, env.GEMINI_API_KEY);
+	} catch (primaryErr: any) {
+		console.warn(`[SourceGuard] Primary model ${PRIMARY_MODEL} error:`, primaryErr.message);
+
+		// If 429, 503, or rate limit, seamlessly fallback to alternative lite model
+		if (primaryErr.status === 429 || primaryErr.status === 503 || primaryErr.message?.includes('rate limit')) {
+			console.log(`[SourceGuard] Switching to fallback model: ${FALLBACK_MODEL}`);
+			return await callGeminiApi(FALLBACK_MODEL, prompt, env.GEMINI_API_KEY);
+		}
+
+		throw primaryErr;
 	}
+}
+
+async function handleRequest(request: Request, env: Env): Promise<Response> {
+	const url = new URL(request.url);
+
+	if (request.method === 'GET' && url.pathname === '/api/health') {
+		return jsonResponse({
+			status: 'success',
+			message: 'SourceGuard backend is running!',
+			geminiConfigured: Boolean(env.GEMINI_API_KEY),
+			timestamp: new Date().toISOString(),
+		});
+	}
+
+	if (request.method === 'POST' && url.pathname === '/api/extract') {
+		try {
+			const body = await request.json() as { url?: string };
+
+			if (
+				typeof body.url !== 'string' ||
+				body.url.length > 2048 ||
+				!isPublicUrl(body.url)
+			) {
+				return jsonResponse(
+					{ status: 'error', error: 'Please provide a valid public URL.' },
+					400
+				);
+			}
+
+			const source = await extractSource({
+				id: 'source-1',
+				type: 'url',
+				content: body.url,
+			});
+
+			return jsonResponse({
+				status: 'success',
+				source: body.url,
+				title: source.title,
+				text: source.content,
+				publishedDate: source.publishedDate || null,
+				fetchedAt: new Date().toISOString(),
+				characterCount: source.content.length,
+			});
+		} catch (error) {
+			return jsonResponse(
+				{
+					status: 'error',
+					error: error instanceof Error ? error.message : 'Extraction failed.',
+				},
+				500
+			);
+		}
+	}
+
+	if (request.method === 'POST' && url.pathname === '/api/analyze') {
+		const requestStart = Date.now();
+		try {
+			const body = await request.json() as {
+				question?: string;
+				sources?: InputSource[];
+			};
+
+			if (
+				typeof body.question !== 'string' ||
+				!body.question.trim()
+			) {
+				return jsonResponse(
+					{ status: 'error', error: 'A research question is required.' },
+					400
+				);
+			}
+
+			if (
+				!Array.isArray(body.sources) ||
+				body.sources.length === 0 ||
+				body.sources.length > 5
+			) {
+				return jsonResponse(
+					{ status: 'error', error: 'Provide between 1 and 5 sources.' },
+					400
+				);
+			}
+
+			for (const source of body.sources) {
+				if (
+					!source ||
+					typeof source.id !== 'string' ||
+					typeof source.content !== 'string' ||
+					!['url', 'text'].includes(source.type) ||
+					(source.type === 'url' && source.content.length > 2048) ||
+					(source.type === 'text' && source.content.length > 12000)
+				) {
+					return jsonResponse(
+						{ status: 'error', error: 'One or more sources are invalid or too large.' },
+						400
+					);
+				}
+
+				if (source.type === 'url' && !isPublicUrl(source.content)) {
+					return jsonResponse(
+						{ status: 'error', error: `Invalid public URL: ${source.content}` },
+						400
+					);
+				}
+			}
+
+			// Parallel source extraction
+			const extractStart = Date.now();
+			const extractionResults = await Promise.all(
+				body.sources.map(async (source) => {
+					try {
+						const extracted = await extractSource(source);
+						return { success: true as const, source: extracted };
+					} catch (error) {
+						return {
+							success: false as const,
+							id: source.id,
+							url: source.type === 'url' ? source.content : undefined,
+							error: error instanceof Error ? error.message : 'Source extraction failed.',
+						};
+					}
+				})
+			);
+			const extractionMs = Date.now() - extractStart;
+
+			const extractedSources = extractionResults
+				.filter((item): item is { success: true; source: ExtractedSource } => item.success)
+				.map(item => item.source);
+
+			const failedSources = extractionResults
+				.filter((item): item is { success: false; id: string; url: string | undefined; error: string } => !item.success)
+				.map(item => ({
+					id: item.id,
+					url: item.url,
+					error: item.error,
+				}));
+
+			if (extractedSources.length === 0) {
+				throw new Error(
+					`None of the sources could be read. ${failedSources.map(s => s.error).join(' | ')}`
+				);
+			}
+
+			// AI Evidence Analysis
+			const aiStart = Date.now();
+			const aiResult = await analyzeWithGemini(
+				body.question,
+				extractedSources,
+				env
+			);
+			const aiAnalysisMs = Date.now() - aiStart;
+
+			const claims = (aiResult.claims || []).map(
+				(claim: any, index: number) => ({
+					id: `claim-${index + 1}`,
+					text: claim.text || '',
+					sourceSupport: claim.sourceSupport || [],
+				})
+			);
+
+			const conflicts = (aiResult.conflicts || []).map(
+				(conflict: any, index: number) => ({
+					id: `conflict-${index + 1}`,
+					...conflict,
+				})
+			);
+
+			const missingInfo = (aiResult.missingInfo || []).map(
+				(item: any, index: number) => ({
+					id: `missing-${index + 1}`,
+					...item,
+				})
+			);
+
+			const totalMs = Date.now() - requestStart;
+			console.log(`[SourceGuard] Analysis completed in ${totalMs}ms (Extract: ${extractionMs}ms, AI: ${aiAnalysisMs}ms)`);
+
+			const report = {
+				id: `analysis-${Date.now()}`,
+				question: body.question,
+				date: new Date().toISOString(),
+				status: aiResult.status || 'insufficient',
+				sources: extractedSources.map(source => ({
+					id: source.id,
+					type: source.type,
+					content: source.type === 'url'
+						? body.sources!.find(s => s.id === source.id)?.content || ''
+						: source.content,
+					title: source.title,
+					domain: source.domain,
+					publishedDate: source.publishedDate,
+				})),
+				summary: aiResult.summary || '',
+				claims,
+				conflicts,
+				freshness: aiResult.freshness || [],
+				missingInfo,
+				conclusion: aiResult.conclusion || '',
+				sourceErrors: failedSources,
+			};
+
+			return jsonResponse({
+				status: 'success',
+				report,
+				meta: {
+					timing: {
+						extractionMs,
+						aiAnalysisMs,
+						totalMs,
+					},
+				},
+			});
+
+		} catch (error) {
+			const message = error instanceof Error
+				? error.message
+				: 'AI analysis failed.';
+
+			const statusCode =
+				message.includes('rate limit or quota') ? 429 :
+					message.includes('temporarily unavailable') ? 503 :
+						500;
+
+			return jsonResponse(
+				{
+					status: 'error',
+					error: message,
+				},
+				statusCode
+			);
+		}
+	}
+
+	return jsonResponse(
+		{ status: 'error', error: 'Route not found.' },
+		404
+	);
 }
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
+		const cors = getCorsHeaders(request);
 		if (request.method === 'OPTIONS') {
-			return new Response(null, { headers: corsHeaders });
+			return new Response(null, { headers: cors });
 		}
 
-		const url = new URL(request.url);
-
-		if (request.method === 'GET' && url.pathname === '/api/health') {
-			return jsonResponse({
-				status: 'success',
-				message: 'SourceGuard backend is running!',
-				geminiConfigured: Boolean(env.GEMINI_API_KEY),
-				timestamp: new Date().toISOString(),
-			});
+		const response = await handleRequest(request, env);
+		const newHeaders = new Headers(response.headers);
+		for (const [key, val] of Object.entries(cors)) {
+			newHeaders.set(key, val);
 		}
 
-		if (request.method === 'POST' && url.pathname === '/api/extract') {
-			try {
-				const body = await request.json() as { url?: string };
-
-				if (
-					typeof body.url !== 'string' ||
-					body.url.length > 2048 ||
-					!isPublicUrl(body.url)
-				) {
-					return jsonResponse(
-						{ status: 'error', error: 'Please provide a valid public URL.' },
-						400
-					);
-				}
-
-				const source = await extractSource({
-					id: 'source-1',
-					type: 'url',
-					content: body.url,
-				});
-
-				return jsonResponse({
-					status: 'success',
-					source: body.url,
-					title: source.title,
-					text: source.content,
-					publishedDate: source.publishedDate || null,
-					fetchedAt: new Date().toISOString(),
-					characterCount: source.content.length,
-				});
-			} catch (error) {
-				return jsonResponse(
-					{
-						status: 'error',
-						error: error instanceof Error ? error.message : 'Extraction failed.',
-					},
-					500
-				);
-			}
-		}
-
-		if (request.method === 'POST' && url.pathname === '/api/analyze') {
-			try {
-				const body = await request.json() as {
-					question?: string;
-					sources?: InputSource[];
-				};
-
-				if (
-					typeof body.question !== 'string' ||
-					!body.question.trim()
-				) {
-					return jsonResponse(
-						{ status: 'error', error: 'A research question is required.' },
-						400
-					);
-				}
-
-				if (
-					!Array.isArray(body.sources) ||
-					body.sources.length === 0 ||
-					body.sources.length > 5
-				) {
-					return jsonResponse(
-						{ status: 'error', error: 'Provide between 1 and 5 sources.' },
-						400
-					);
-				}
-
-				for (const source of body.sources) {
-					if (
-						!source ||
-						typeof source.id !== 'string' ||
-						typeof source.content !== 'string' ||
-						!['url', 'text'].includes(source.type) ||
-						(source.type === 'url' && source.content.length > 2048) ||
-						(source.type === 'text' && source.content.length > 12000)
-					) {
-						return jsonResponse(
-							{ status: 'error', error: 'One or more sources are invalid or too large.' },
-							400
-						);
-					}
-
-					if (source.type === 'url' && !isPublicUrl(source.content)) {
-						return jsonResponse(
-							{ status: 'error', error: `Invalid public URL: ${source.content}` },
-							400
-						);
-					}
-				}
-
-				// Try every source separately. A failed URL will not stop other sources.
-				const extractionResults = await Promise.all(
-					body.sources.map(async (source) => {
-						try {
-							const extracted = await extractSource(source);
-							return { success: true as const, source: extracted };
-						} catch (error) {
-							return {
-								success: false as const,
-								id: source.id,
-								url: source.type === 'url' ? source.content : undefined,
-								error: error instanceof Error ? error.message : 'Source extraction failed.',
-							};
-						}
-					})
-				);
-
-				const extractedSources = extractionResults
-					.filter((item): item is { success: true; source: ExtractedSource } => item.success)
-					.map(item => item.source);
-
-				const failedSources = extractionResults
-					.filter((item): item is { success: false; id: string; url: string | undefined; error: string } => !item.success)
-					.map(item => ({
-						id: item.id,
-						url: item.url,
-						error: item.error,
-					}));
-
-				if (extractedSources.length === 0) {
-					throw new Error(
-						`None of the sources could be read. ${failedSources.map(s => s.error).join(' | ')}`
-					);
-				}
-
-				const aiResult = await analyzeWithGemini(
-					body.question,
-					extractedSources,
-					env
-				);
-
-				const claims = (aiResult.claims || []).map(
-					(claim: any, index: number) => ({
-						id: `claim-${index + 1}`,
-						text: claim.text || '',
-						sourceSupport: claim.sourceSupport || [],
-					})
-				);
-
-				const conflicts = (aiResult.conflicts || []).map(
-					(conflict: any, index: number) => ({
-						id: `conflict-${index + 1}`,
-						...conflict,
-					})
-				);
-
-				const missingInfo = (aiResult.missingInfo || []).map(
-					(item: any, index: number) => ({
-						id: `missing-${index + 1}`,
-						...item,
-					})
-				);
-
-				const report = {
-					id: `analysis-${Date.now()}`,
-					question: body.question,
-					date: new Date().toISOString(),
-					status: aiResult.status || 'insufficient',
-					sources: extractedSources.map(source => ({
-						id: source.id,
-						type: source.type,
-						content: source.type === 'url'
-							? body.sources!.find(s => s.id === source.id)?.content || ''
-							: source.content,
-						title: source.title,
-						domain: source.domain,
-						publishedDate: source.publishedDate,
-					})),
-					summary: aiResult.summary || '',
-					claims,
-					conflicts,
-					freshness: aiResult.freshness || [],
-					missingInfo,
-					conclusion: aiResult.conclusion || '',
-					sourceErrors: failedSources,
-				};
-
-				return jsonResponse({
-					status: 'success',
-					report,
-				});
-
-			} catch (error) {
-				const message = error instanceof Error
-					? error.message
-					: 'AI analysis failed.';
-
-				const statusCode =
-					message.includes('rate limit or quota') ? 429 :
-						message.includes('temporarily unavailable') ? 503 :
-							500;
-
-				return jsonResponse(
-					{
-						status: 'error',
-						error: message,
-					},
-					statusCode
-				);
-			}
-		}
-
-		return jsonResponse(
-			{ status: 'error', error: 'Route not found.' },
-			404
-		);
+		return new Response(response.body, {
+			status: response.status,
+			statusText: response.statusText,
+			headers: newHeaders,
+		});
 	},
 };

@@ -1,24 +1,21 @@
 import { AnalysisResult, Source, AnalysisOptions } from '../types';
-import { mockAnalysisResult } from '../data/mockAnalysis';
+import { analyzeSources } from './sourceApi';
 
-// Simulates an analysis API call
-// In production, this would call your AI backend
 export async function runAnalysis(
   question: string,
   sources: Source[],
   _options: AnalysisOptions
 ): Promise<AnalysisResult> {
-  // Simulate network delay
-  await new Promise((resolve) => setTimeout(resolve, 3000));
+  if (!question.trim()) {
+    throw new Error('Please enter a research question.');
+  }
 
-  // Return mock result customized with the user's question and sources
-  const result: AnalysisResult = {
-    ...mockAnalysisResult,
-    id: `analysis-${Date.now()}`,
-    question,
-    date: new Date().toISOString(),
-    sources: sources.length > 0 ? sources : mockAnalysisResult.sources,
-  };
+  if (sources.length === 0) {
+    throw new Error('Please add at least one source.');
+  }
+
+  const result = await analyzeSources(question, sources);
 
   return result;
 }
+

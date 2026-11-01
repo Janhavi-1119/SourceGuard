@@ -140,18 +140,18 @@ export default function NewAnalysis() {
 
     // Progression of the in-flight preparation stages
     const progressTimeline = async () => {
-      // Stage 1: Collecting Sources (~800ms)
-      await new Promise((r) => setTimeout(r, 800));
+      // Stage 1: Collecting Sources (~400ms)
+      await new Promise((r) => setTimeout(r, 400));
       if (cancelRef.current) return;
       setCurrentStage(2);
 
-      // Stage 2: Extracting Content (~1400ms)
-      await new Promise((r) => setTimeout(r, 1400));
+      // Stage 2: Extracting Content (~600ms)
+      await new Promise((r) => setTimeout(r, 600));
       if (cancelRef.current) return;
       setCurrentStage(3);
 
-      // Stage 3: Analysing Claims (~1800ms)
-      await new Promise((r) => setTimeout(r, 1800));
+      // Stage 3: Analysing Claims (~800ms)
+      await new Promise((r) => setTimeout(r, 800));
       if (cancelRef.current) return;
       setCurrentStage(4);
 
@@ -179,12 +179,12 @@ export default function NewAnalysis() {
 
       // When the real backend analysis resolves, transition to Stage 5: Preparing Report
       setCurrentStage(5);
-      await new Promise((r) => setTimeout(r, 600));
+      await new Promise((r) => setTimeout(r, 200));
       if (cancelRef.current) return;
 
       // Mark all stages complete
       setIsStageComplete(true);
-      await new Promise((r) => setTimeout(r, 500));
+      await new Promise((r) => setTimeout(r, 150));
       if (cancelRef.current) return;
 
       // Display the final verification report
